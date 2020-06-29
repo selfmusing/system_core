@@ -1349,6 +1349,11 @@ void FlashAllTool::Flash() {
     // or in bootloader fastboot.
     FlashImages(boot_images_);
 
+#ifdef TARGET_USES_PREBUILT_DYNAMIC_PARTITIONS
+    if (!is_userspace_fastboot()) {
+        reboot_to_userspace_fastboot();
+    }
+#else
     // Sync the super partition. This will reboot to userspace fastboot if needed.
     UpdateSuperPartition();
 
@@ -1362,6 +1367,7 @@ void FlashAllTool::Flash() {
         };
         do_for_partitions(image->part_name, slot, resize_partition, false);
     }
+#endif
 
     // Flash OS images, resizing logical partitions as needed.
     FlashImages(os_images_);
