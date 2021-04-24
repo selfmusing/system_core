@@ -1002,9 +1002,7 @@ static void copy_boot_avb_footer(const std::string& partition, struct fastboot_b
 
     std::string partition_size_str;
     if (fb->GetVar("partition-size:" + partition, &partition_size_str) != fastboot::SUCCESS) {
-        fprintf(stderr, "Warning: cannot get '%s' partition size, not appending AVB footer\n",
-                partition.c_str());
-        return;
+        die("cannot get boot partition size");
     }
 
     partition_size_str = fb_fix_numeric_var(partition_size_str);
