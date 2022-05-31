@@ -45,7 +45,6 @@
 #define POWER_SUPPLY_SUBSYSTEM "power_supply"
 #define POWER_SUPPLY_SYSFS_PATH "/sys/class/" POWER_SUPPLY_SUBSYSTEM
 #define SYSFS_BATTERY_CURRENT "/sys/class/power_supply/battery/current_now"
-#define SYSFS_BATTERY_VOLTAGE "/sys/class/power_supply/battery/voltage_now"
 #define FAKE_BATTERY_CAPACITY 42
 #define FAKE_BATTERY_TEMPERATURE 424
 #define MILLION 1.0e6
@@ -364,9 +363,13 @@ void BatteryMonitor::updateValues(void) {
             int ChargingCurrent =
                   (access(SYSFS_BATTERY_CURRENT, R_OK) == 0) ? abs(getIntField(String8(SYSFS_BATTERY_CURRENT))) : 0;
 
+            path.clear();
+            path.appendFormat("%s/%s/voltage_now", POWER_SUPPLY_SYSFS_PATH,
+                              mChargerNames[i].string());
+
             int ChargingVoltage =
-                  (access(SYSFS_BATTERY_VOLTAGE, R_OK) == 0) ? getIntField(String8(SYSFS_BATTERY_VOLTAGE)) :
-                   DEFAULT_VBUS_VOLTAGE;
+                (access(path.string(), R_OK) == 0) ? getIntField(path) :
+                DEFAULT_VBUS_VOLTAGE;
 
             // there are devices that have the file but with a value of 0
             if (ChargingVoltage == 0) {
