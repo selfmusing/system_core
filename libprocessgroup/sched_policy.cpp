@@ -124,6 +124,8 @@ int set_sched_policy(int tid, SchedPolicy policy) {
             return SetTaskProfiles(tid, {"SCHED_SP_FOREGROUND"}, true) ? 0 : -1;
         case SP_TOP_APP:
             return SetTaskProfiles(tid, {"SCHED_SP_TOP_APP"}, true) ? 0 : -1;
+        case SP_SYSTEM:
+            return SetTaskProfiles(tid, {"SCHED_SP_SYSTEM"}, true) ? 0 : -1;
         case SP_RT_APP:
             return SetTaskProfiles(tid, {"SCHED_SP_RT_APP"}, true) ? 0 : -1;
         default:
@@ -157,29 +159,13 @@ static int getCGroupSubsys(int tid, const char* subsys, std::string& subgroup) {
 
     if (!controller.IsUsable()) return -1;
 
-    if (!controller.GetTaskGroup(tid, &subgroup)) {
-        LOG(ERROR) << "Failed to find cgroup for tid " << tid;
+    if (!controller.GetTaskGroup(tid, &subgroup))
         return -1;
-    }
+
     return 0;
 }
 
-int get_sched_policy(int tid, SchedPolicy* policy) {
-    if (tid == 0) {
-        tid = GetThreadId();
-    }
-
-    std::string group;
-    if (schedboost_enabled()) {
-        if ((getCGroupSubsys(tid, "schedtune", group) < 0) &&
-            (getCGroupSubsys(tid, "cpu", group) < 0))
-		return -1;
-    }
-    if (group.empty() && cpusets_enabled()) {
-        if (getCGroupSubsys(tid, "cpuset", group) < 0) return -1;
-    }
-
-    // TODO: replace hardcoded directories
+static int get_sched_policy_from_group(const std::string& group, SchedPolicy* policy) {
     if (group.empty()) {
         *policy = SP_FOREGROUND;
     } else if (group == "foreground") {
@@ -197,6 +183,35 @@ int get_sched_policy(int tid, SchedPolicy* policy) {
         return -1;
     }
     return 0;
+}
+
+int get_sched_policy(int tid, SchedPolicy* policy) {
+    if (tid == 0) {
+        tid = GetThreadId();
+    }
+
+    std::string group;
+    if (schedboost_enabled()) {
+        if ((getCGroupSubsys(tid, "schedtune", group) < 0) &&
+            (getCGroupSubsys(tid, "cpu", group) < 0)) {
+            LOG(ERROR) << "Failed to find cpu cgroup for tid " << tid;
+            return -1;
+        }
+        // Wipe invalid group to fallback to cpuset
+        if (!group.empty()) {
+            if (get_sched_policy_from_group(group, policy) < 0) {
+                group.clear();
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    if (cpusets_enabled() && getCGroupSubsys(tid, "cpuset", group) < 0) {
+        LOG(ERROR) << "Failed to find cpuset cgroup for tid " << tid;
+        return -1;
+    }
+    return get_sched_policy_from_group(group, policy);
 }
 
 #else
@@ -258,7 +273,7 @@ const char* get_sched_policy_profile_name(SchedPolicy policy) {
      */
     static constexpr const char* kSchedProfiles[SP_CNT + 1] = {
             "SCHED_SP_DEFAULT", "SCHED_SP_BACKGROUND", "SCHED_SP_FOREGROUND",
-            "SCHED_SP_DEFAULT", "SCHED_SP_FOREGROUND", "SCHED_SP_FOREGROUND",
+            "SCHED_SP_SYSTEM",  "SCHED_SP_FOREGROUND", "SCHED_SP_FOREGROUND",
             "SCHED_SP_TOP_APP", "SCHED_SP_RT_APP",     "SCHED_SP_DEFAULT"};
     if (policy < SP_DEFAULT || policy >= SP_CNT) {
         return nullptr;

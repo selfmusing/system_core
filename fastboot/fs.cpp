@@ -206,6 +206,13 @@ static int generate_f2fs_image(const char* fileName, long long partSize,
         mkf2fs_args.push_back("utf8");
     }
 
+    if (fsOptions & (1 << FS_OPT_COMPRESS)) {
+        mkf2fs_args.push_back("-O");
+        mkf2fs_args.push_back("compression");
+        mkf2fs_args.push_back("-O");
+        mkf2fs_args.push_back("extra_attr");
+    }
+
     mkf2fs_args.push_back(fileName);
     mkf2fs_args.push_back(nullptr);
 

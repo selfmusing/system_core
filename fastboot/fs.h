@@ -8,6 +8,7 @@ struct fs_generator;
 enum FS_OPTION {
     FS_OPT_CASEFOLD,
     FS_OPT_PROJID,
+    FS_OPT_COMPRESS,
 };
 
 const struct fs_generator* fs_get_generator(const std::string& fs_type);

@@ -45,7 +45,7 @@
 
 #include "cgroup_descriptor.h"
 
-using android::base::GetBoolProperty;
+using android::base::GetUintProperty;
 using android::base::StringPrintf;
 using android::base::unique_fd;
 
@@ -54,6 +54,8 @@ namespace cgrouprc {
 
 static constexpr const char* CGROUPS_DESC_FILE = "/etc/cgroups.json";
 static constexpr const char* CGROUPS_DESC_VENDOR_FILE = "/vendor/etc/cgroups.json";
+
+static constexpr const char* TEMPLATE_CGROUPS_DESC_API_FILE = "/etc/task_profiles/cgroups_%u.json";
 
 static bool ChangeDirModeAndOwner(const std::string& path, mode_t mode, const std::string& uid,
                                   const std::string& gid, bool permissive_mode = false) {
@@ -159,6 +161,10 @@ static void MergeCgroupToDescriptors(std::map<std::string, CgroupDescriptor>* de
         controller_flags |= CGROUPRC_CONTROLLER_FLAG_NEEDS_ACTIVATION;
     }
 
+    if (cgroup["Optional"].isBool() && cgroup["Optional"].asBool()) {
+        controller_flags |= CGROUPRC_CONTROLLER_FLAG_OPTIONAL;
+    }
+
     CgroupDescriptor descriptor(
             cgroups_version, name, path, std::strtoul(cgroup["Mode"].asString().c_str(), 0, 8),
             cgroup["UID"].asString(), cgroup["GID"].asString(), controller_flags);
@@ -181,10 +187,12 @@ static bool ReadDescriptorsFromFile(const std::string& file_name,
         return false;
     }
 
-    Json::Reader reader;
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     Json::Value root;
-    if (!reader.parse(json_doc, root)) {
-        LOG(ERROR) << "Failed to parse cgroups description: " << reader.getFormattedErrorMessages();
+    std::string errorMessage;
+    if (!reader->parse(&*json_doc.begin(), &*json_doc.end(), &root, &errorMessage)) {
+        LOG(ERROR) << "Failed to parse cgroups description: " << errorMessage;
         return false;
     }
 
@@ -215,6 +223,18 @@ static bool ReadDescriptors(std::map<std::string, CgroupDescriptor>* descriptors
     // load system cgroup descriptors
     if (!ReadDescriptorsFromFile(CGROUPS_DESC_FILE, descriptors)) {
         return false;
+    }
+
+    // load API-level specific system cgroups descriptors if available
+    unsigned int api_level = GetUintProperty<unsigned int>("ro.product.first_api_level", 0);
+    if (api_level > 0) {
+        std::string api_cgroups_path =
+                android::base::StringPrintf(TEMPLATE_CGROUPS_DESC_API_FILE, api_level);
+        if (!access(api_cgroups_path.c_str(), F_OK) || errno != ENOENT) {
+            if (!ReadDescriptorsFromFile(api_cgroups_path, descriptors)) {
+                return false;
+            }
+        }
     }
 
     // load vendor cgroup descriptors if the file exists
@@ -251,8 +271,6 @@ static bool SetupCgroup(const CgroupDescriptor& descriptor) {
                                        descriptor.gid())) {
                 LOG(ERROR) << "Failed to create directory for " << controller->name() << " cgroup";
                 result = -1;
-            } else {
-                LOG(ERROR) << "restored ownership for " << controller->name() << " cgroup";
             }
         } else {
             if (!Mkdir(controller->path(), descriptor.mode(), descriptor.uid(), descriptor.gid())) {
@@ -294,8 +312,15 @@ static bool SetupCgroup(const CgroupDescriptor& descriptor) {
     }
 
     if (result < 0) {
-        PLOG(ERROR) << "Failed to mount " << controller->name() << " cgroup";
-        return false;
+        bool optional = controller->flags() & CGROUPRC_CONTROLLER_FLAG_OPTIONAL;
+
+        if (optional && errno == EINVAL) {
+            // Optional controllers are allowed to fail to mount if kernel does not support them
+            LOG(INFO) << "Optional " << controller->name() << " cgroup controller is not mounted";
+        } else {
+            PLOG(ERROR) << "Failed to mount " << controller->name() << " cgroup";
+            return false;
+        }
     }
 
     return true;

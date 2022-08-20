@@ -88,6 +88,7 @@ using namespace std::literals::string_literals;
 
 using android::base::Basename;
 using android::base::SetProperty;
+using android::base::Split;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
@@ -288,6 +289,38 @@ static Result<void> do_export(const BuiltinArguments& args) {
     if (setenv(args[1].c_str(), args[2].c_str(), 1) == -1) {
         return ErrnoError() << "setenv() failed";
     }
+    return {};
+}
+
+static Result<void> do_load_exports(const BuiltinArguments& args) {
+    auto file_contents = ReadFile(args[1]);
+    if (!file_contents.ok()) {
+        return Error() << "Could not read input file '" << args[1]
+                       << "': " << file_contents.error();
+    }
+
+    auto lines = Split(*file_contents, "\n");
+    for (const auto& line : lines) {
+        if (line.empty()) {
+            continue;
+        }
+
+        auto env = Split(line, " ");
+
+        if (env.size() != 3) {
+            return ErrnoError() << "Expected a line as `export <name> <value>`, found: `" << line
+                                << "`";
+        }
+
+        if (env[0] != "export") {
+            return ErrnoError() << "Unknown action: '" << env[0] << "', expected 'export'";
+        }
+
+        if (setenv(env[1].c_str(), env[2].c_str(), 1) == -1) {
+            return ErrnoError() << "Failed to export '" << line << "' from " << args[1];
+        }
+    }
+
     return {};
 }
 
@@ -570,7 +603,6 @@ static Result<void> queue_fs_event(int code, bool userdata_remount) {
             trigger_shutdown("reboot,requested-userdata-remount-on-fde-device");
         }
         SetProperty("ro.crypto.state", "encrypted");
-        SetProperty("ro.crypto.type", "block");
         ActionManager::GetInstance().QueueEventTrigger("defaultcrypto");
         return {};
     } else if (code == FS_MGR_MNTALL_DEV_NOT_ENCRYPTED) {
@@ -595,7 +627,6 @@ static Result<void> queue_fs_event(int code, bool userdata_remount) {
             return Error() << "FscryptInstallKeyring() failed";
         }
         SetProperty("ro.crypto.state", "encrypted");
-        SetProperty("ro.crypto.type", "file");
 
         // Although encrypted, we have device key, so we do not need to
         // do anything different from the nonencrypted case.
@@ -606,7 +637,6 @@ static Result<void> queue_fs_event(int code, bool userdata_remount) {
             return Error() << "FscryptInstallKeyring() failed";
         }
         SetProperty("ro.crypto.state", "encrypted");
-        SetProperty("ro.crypto.type", "file");
 
         // Although encrypted, vold has already set the device up, so we do not need to
         // do anything different from the nonencrypted case.
@@ -617,7 +647,6 @@ static Result<void> queue_fs_event(int code, bool userdata_remount) {
             return Error() << "FscryptInstallKeyring() failed";
         }
         SetProperty("ro.crypto.state", "encrypted");
-        SetProperty("ro.crypto.type", "file");
 
         // Although encrypted, vold has already set the device up, so we do not need to
         // do anything different from the nonencrypted case.
@@ -864,6 +893,11 @@ static Result<void> do_verity_update_state(const BuiltinArguments& args) {
         // for system as root, so it has property [partition.system.verified].
         std::string partition = entry.mount_point == "/" ? "system" : Basename(entry.mount_point);
         SetProperty("partition." + partition + ".verified", std::to_string(mode));
+
+        std::string hash_alg = fs_mgr_get_hashtree_algorithm(entry);
+        if (!hash_alg.empty()) {
+            SetProperty("partition." + partition + ".verified.hash_alg", hash_alg);
+        }
     }
 
     return {};
@@ -967,6 +1001,23 @@ static Result<void> do_copy(const BuiltinArguments& args) {
     }
     if (auto result = WriteFile(args[2], *file_contents); !result.ok()) {
         return Error() << "Could not write to output file '" << args[2] << "': " << result.error();
+    }
+
+    return {};
+}
+
+static Result<void> do_copy_per_line(const BuiltinArguments& args) {
+    std::string file_contents;
+    if (!android::base::ReadFileToString(args[1], &file_contents, true)) {
+        return Error() << "Could not read input file '" << args[1] << "'";
+    }
+    auto lines = Split(file_contents, "\n");
+    for (const auto& line : lines) {
+        auto result = WriteFile(args[2], line);
+        if (!result.ok()) {
+            LOG(VERBOSE) << "Could not write to output file '" << args[2] << "' with '" << line
+                         << "' : " << result.error();
+        }
     }
 
     return {};
@@ -1185,6 +1236,10 @@ static Result<void> do_remount_userdata(const BuiltinArguments& args) {
     }
     // TODO(b/135984674): check that fstab contains /data.
     if (auto rc = fs_mgr_remount_userdata_into_checkpointing(&fstab); rc < 0) {
+        std::string proc_mounts_output;
+        android::base::ReadFileToString("/proc/mounts", &proc_mounts_output, true);
+        android::base::WriteStringToFile(proc_mounts_output,
+                                         "/metadata/userspacereboot/mount_info.txt");
         trigger_shutdown("reboot,mount_userdata_failed");
     }
     if (auto result = queue_fs_event(initial_mount_fstab_return_code, true); !result.ok()) {
@@ -1214,7 +1269,7 @@ static Result<void> do_mark_post_data(const BuiltinArguments& args) {
 }
 
 static Result<void> GenerateLinkerConfiguration() {
-    const char* linkerconfig_binary = "/system/bin/linkerconfig";
+    const char* linkerconfig_binary = "/apex/com.android.runtime/bin/linkerconfig";
     const char* linkerconfig_target = "/linkerconfig";
     const char* arguments[] = {linkerconfig_binary, "--target", linkerconfig_target};
 
@@ -1223,8 +1278,30 @@ static Result<void> GenerateLinkerConfiguration() {
         return ErrnoError() << "failed to execute linkerconfig";
     }
 
+    auto current_mount_ns = GetCurrentMountNamespace();
+    if (!current_mount_ns.ok()) {
+        return current_mount_ns.error();
+    }
+    if (*current_mount_ns == NS_DEFAULT) {
+        SetDefaultMountNamespaceReady();
+    }
+
     LOG(INFO) << "linkerconfig generated " << linkerconfig_target
               << " with mounted APEX modules info";
+
+    return {};
+}
+
+static Result<void> MountLinkerConfigForDefaultNamespace() {
+    // No need to mount linkerconfig for default mount namespace if the path does not exist (which
+    // would mean it is already mounted)
+    if (access("/linkerconfig/default", 0) != 0) {
+        return {};
+    }
+
+    if (mount("/linkerconfig/default", "/linkerconfig", nullptr, MS_BIND | MS_REC, nullptr) != 0) {
+        return ErrnoError() << "Failed to mount linker configuration for default mount namespace.";
+    }
 
     return {};
 }
@@ -1327,11 +1404,14 @@ static Result<void> do_perform_apex_config(const BuiltinArguments& args) {
 }
 
 static Result<void> do_enter_default_mount_ns(const BuiltinArguments& args) {
-    if (SwitchToDefaultMountNamespace()) {
-        return {};
-    } else {
-        return Error() << "Failed to enter into default mount namespace";
+    if (auto result = SwitchToMountNamespaceIfNeeded(NS_DEFAULT); !result.ok()) {
+        return result.error();
     }
+    if (auto result = MountLinkerConfigForDefaultNamespace(); !result.ok()) {
+        return result.error();
+    }
+    LOG(INFO) << "Switched to default mount namespace";
+    return {};
 }
 
 // Builtin-function-map start
@@ -1349,6 +1429,7 @@ const BuiltinFunctionMap& GetBuiltinFunctionMap() {
         {"class_start_post_data",   {1,     1,    {false,  do_class_start_post_data}}},
         {"class_stop",              {1,     1,    {false,  do_class_stop}}},
         {"copy",                    {2,     2,    {true,   do_copy}}},
+        {"copy_per_line",           {2,     2,    {true,   do_copy_per_line}}},
         {"domainname",              {1,     1,    {true,   do_domainname}}},
         {"enable",                  {1,     1,    {false,  do_enable}}},
         {"exec",                    {1,     kMax, {false,  do_exec}}},
@@ -1363,6 +1444,7 @@ const BuiltinFunctionMap& GetBuiltinFunctionMap() {
         {"interface_restart",       {1,     1,    {false,  do_interface_restart}}},
         {"interface_start",         {1,     1,    {false,  do_interface_start}}},
         {"interface_stop",          {1,     1,    {false,  do_interface_stop}}},
+        {"load_exports",            {1,     1,    {false,  do_load_exports}}},
         {"load_persist_props",      {0,     0,    {false,  do_load_persist_props}}},
         {"load_system_props",       {0,     0,    {false,  do_load_system_props}}},
         {"loglevel",                {1,     1,    {false,  do_loglevel}}},

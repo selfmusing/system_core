@@ -26,6 +26,8 @@ using namespace android;
 
 class HealthdDraw {
  public:
+  // Configures font using given animation.
+  HealthdDraw(animation* anim);
   virtual ~HealthdDraw();
 
   // Redraws screen.
@@ -33,8 +35,6 @@ class HealthdDraw {
 
   // Blanks screen if true, unblanks if false.
   virtual void blank_screen(bool blank);
-
-  static std::unique_ptr<HealthdDraw> Create(animation *anim);
 
  protected:
   virtual void clear_screen();
@@ -76,10 +76,6 @@ class HealthdDraw {
 
   // true if minui init'ed OK, false if minui init failed
   bool graphics_available;
-
- private:
-  // Configures font using given animation.
-  HealthdDraw(animation* anim);
 };
 
 #endif  // HEALTHD_DRAW_H

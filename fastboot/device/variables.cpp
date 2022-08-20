@@ -33,6 +33,12 @@
 #include "flashing.h"
 #include "utility.h"
 
+#ifdef FB_ENABLE_FETCH
+static constexpr bool kEnableFetch = true;
+#else
+static constexpr bool kEnableFetch = false;
+#endif
+
 using ::android::hardware::boot::V1_0::BoolResult;
 using ::android::hardware::boot::V1_0::Slot;
 using ::android::hardware::boot::V1_1::MergeStatus;
@@ -333,8 +339,8 @@ bool GetPartitionType(FastbootDevice* device, const std::vector<std::string>& ar
 
     auto fastboot_hal = device->fastboot_hal();
     if (!fastboot_hal) {
-        *message = "Fastboot HAL not found";
-        return false;
+        *message = "raw";
+        return true;
     }
 
     FileSystemType type;
@@ -429,7 +435,10 @@ std::vector<std::vector<std::string>> GetAllPartitionArgsNoSlot(FastbootDevice* 
 
 bool GetHardwareRevision(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
                          std::string* message) {
-    *message = android::base::GetProperty("ro.revision", "");
+    *message = android::base::GetProperty("ro.boot.hardware.revision", "");
+    if (message->empty()) {
+        *message = android::base::GetProperty("ro.revision", "");
+    }
     return true;
 }
 
@@ -507,5 +516,15 @@ bool GetSecurityPatchLevel(FastbootDevice* /* device */, const std::vector<std::
 bool GetTrebleEnabled(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
                       std::string* message) {
     *message = android::base::GetProperty("ro.treble.enabled", "");
+    return true;
+}
+
+bool GetMaxFetchSize(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
+                     std::string* message) {
+    if (!kEnableFetch) {
+        *message = "fetch not supported on user builds";
+        return false;
+    }
+    *message = android::base::StringPrintf("0x%X", kMaxFetchSizeDefault);
     return true;
 }

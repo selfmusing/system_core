@@ -72,6 +72,7 @@
 #include <log/log_properties.h>
 #include <logwrap/logwrap.h>
 
+#include "blockdev.h"
 #include "fs_mgr_priv.h"
 
 #define KEY_LOC_PROP   "ro.crypto.keyfile.userdata"
@@ -172,6 +173,22 @@ static bool should_force_check(int fs_stat) {
             FS_STAT_SET_RESERVED_BLOCKS_FAILED | FS_STAT_ENABLE_ENCRYPTION_FAILED);
 }
 
+static bool umount_retry(const std::string& mount_point) {
+    int retry_count = 5;
+    bool umounted = false;
+
+    while (retry_count-- > 0) {
+        umounted = umount(mount_point.c_str()) == 0;
+        if (umounted) {
+            LINFO << __FUNCTION__ << "(): unmount(" << mount_point << ") succeeded";
+            break;
+        }
+        PERROR << __FUNCTION__ << "(): umount(" << mount_point << ") failed";
+        if (retry_count) sleep(1);
+    }
+    return umounted;
+}
+
 static void check_fs(const std::string& blk_device, const std::string& fs_type,
                      const std::string& target, int* fs_stat) {
     int status;
@@ -211,25 +228,12 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
                         tmpmnt_opts.c_str());
             PINFO << __FUNCTION__ << "(): mount(" << blk_device << "," << target << "," << fs_type
                   << ")=" << ret;
-            if (!ret) {
-                bool umounted = false;
-                int retry_count = 5;
-                while (retry_count-- > 0) {
-                    umounted = umount(target.c_str()) == 0;
-                    if (umounted) {
-                        LINFO << __FUNCTION__ << "(): unmount(" << target << ") succeeded";
-                        break;
-                    }
-                    PERROR << __FUNCTION__ << "(): umount(" << target << ") failed";
-                    if (retry_count) sleep(1);
-                }
-                if (!umounted) {
-                    // boot may fail but continue and leave it to later stage for now.
-                    PERROR << __FUNCTION__ << "(): umount(" << target << ") timed out";
-                    *fs_stat |= FS_STAT_RO_UNMOUNT_FAILED;
-                }
-            } else {
+            if (ret) {
                 *fs_stat |= FS_STAT_RO_MOUNT_FAILED;
+            } else if (!umount_retry(target)) {
+                // boot may fail but continue and leave it to later stage for now.
+                PERROR << __FUNCTION__ << "(): umount(" << target << ") timed out";
+                *fs_stat |= FS_STAT_RO_UNMOUNT_FAILED;
             }
         }
 
@@ -267,15 +271,15 @@ static void check_fs(const std::string& blk_device, const std::string& fs_type,
                 F2FS_FSCK_BIN, "-f", "-c", "10000", "--debug-cache", blk_device.c_str()};
 
         if (should_force_check(*fs_stat)) {
-            LINFO << "Running " << F2FS_FSCK_BIN << " -f -c 10000 --debug-cache"
+            LINFO << "Running " << F2FS_FSCK_BIN << " -f -c 10000 --debug-cache "
                   << realpath(blk_device);
             ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_forced_argv), f2fs_fsck_forced_argv,
-                                      &status, false, LOG_KLOG | LOG_FILE, false, FSCK_LOG_FILE);
+                                      &status, false, LOG_KLOG | LOG_FILE, false, nullptr);
         } else {
-            LINFO << "Running " << F2FS_FSCK_BIN << " -a -c 10000 --debug-cache"
+            LINFO << "Running " << F2FS_FSCK_BIN << " -a -c 10000 --debug-cache "
                   << realpath(blk_device);
             ret = logwrap_fork_execvp(ARRAY_SIZE(f2fs_fsck_argv), f2fs_fsck_argv, &status, false,
-                                      LOG_KLOG | LOG_FILE, false, FSCK_LOG_FILE);
+                                      LOG_KLOG | LOG_FILE, false, nullptr);
         }
         if (ret < 0) {
             /* No need to check for error in fork, we can't really handle it now */
@@ -530,7 +534,7 @@ static void tune_casefold(const std::string& blk_device, const FstabEntry& entry
     bool wants_casefold =
             android::base::GetBoolProperty("external_storage.casefold.enabled", false);
 
-    if (entry.mount_point != "data" || !wants_casefold || has_casefold ) return;
+    if (entry.mount_point != "/data" || !wants_casefold || has_casefold) return;
 
     std::string casefold_support;
     if (!android::base::ReadFileToString(SYSFS_EXT4_CASEFOLD, &casefold_support)) {
@@ -585,11 +589,10 @@ static void tune_metadata_csum(const std::string& blk_device, const FstabEntry& 
 
     LINFO << "Enabling ext4 metadata_csum on " << blk_device;
 
-    // requires to give last_fsck_time to current to avoid insane time.
+    // Must give `-T now` to prevent last_fsck_time from growing too large,
     // otherwise, tune2fs won't enable metadata_csum.
-    std::string now = std::to_string(time(0));
     const char* tune2fs_args[] = {TUNE2FS_BIN, "-O",        "metadata_csum,64bit,extent",
-                                  "-T",        now.c_str(), blk_device.c_str()};
+                                  "-T",        "now", blk_device.c_str()};
     const char* resize2fs_args[] = {RESIZE2FS_BIN, "-b", blk_device.c_str()};
 
     if (!run_command(tune2fs_args, ARRAY_SIZE(tune2fs_args))) {
@@ -651,6 +654,46 @@ bool fs_mgr_is_f2fs(const std::string& blk_device) {
     return sb == cpu_to_le32(F2FS_SUPER_MAGIC);
 }
 
+static void SetReadAheadSize(const std::string& entry_block_device, off64_t size_kb) {
+    std::string block_device;
+    if (!Realpath(entry_block_device, &block_device)) {
+        PERROR << "Failed to realpath " << entry_block_device;
+        return;
+    }
+
+    static constexpr std::string_view kDevBlockPrefix("/dev/block/");
+    if (!android::base::StartsWith(block_device, kDevBlockPrefix)) {
+        LWARNING << block_device << " is not a block device";
+        return;
+    }
+
+    DeviceMapper& dm = DeviceMapper::Instance();
+    while (true) {
+        std::string block_name = block_device;
+        if (android::base::StartsWith(block_device, kDevBlockPrefix)) {
+            block_name = block_device.substr(kDevBlockPrefix.length());
+        }
+        std::string sys_partition =
+                android::base::StringPrintf("/sys/class/block/%s/partition", block_name.c_str());
+        struct stat info;
+        if (lstat(sys_partition.c_str(), &info) == 0) {
+            // it has a partition like "sda12".
+            block_name += "/..";
+        }
+        std::string sys_ra = android::base::StringPrintf("/sys/class/block/%s/queue/read_ahead_kb",
+                                                         block_name.c_str());
+        std::string size = android::base::StringPrintf("%llu", (long long)size_kb);
+        android::base::WriteStringToFile(size, sys_ra.c_str());
+        LINFO << "Set readahead_kb: " << size << " on " << sys_ra;
+
+        auto parent = dm.GetParentBlockDeviceByPath(block_device);
+        if (!parent) {
+            return;
+        }
+        block_device = *parent;
+    }
+}
+
 //
 // Prepare the filesystem on the given block device to be mounted.
 //
@@ -660,7 +703,22 @@ bool fs_mgr_is_f2fs(const std::string& blk_device) {
 // If needed, we'll also enable (or disable) filesystem features as specified by
 // the fstab record.
 //
-static int prepare_fs_for_mount(const std::string& blk_device, const FstabEntry& entry) {
+static int prepare_fs_for_mount(const std::string& blk_device, const FstabEntry& entry,
+                                const std::string& alt_mount_point = "") {
+    auto& mount_point = alt_mount_point.empty() ? entry.mount_point : alt_mount_point;
+    // We need this because sometimes we have legacy symlinks that are
+    // lingering around and need cleaning up.
+    struct stat info;
+    if (lstat(mount_point.c_str(), &info) == 0 && (info.st_mode & S_IFMT) == S_IFLNK) {
+        unlink(mount_point.c_str());
+    }
+    mkdir(mount_point.c_str(), 0755);
+
+    // Don't need to return error, since it's a salt
+    if (entry.readahead_size_kb != -1) {
+        SetReadAheadSize(blk_device, entry.readahead_size_kb);
+    }
+
     int fs_stat = 0;
 
     if (is_extfs(entry.fs_type)) {
@@ -688,7 +746,7 @@ static int prepare_fs_for_mount(const std::string& blk_device, const FstabEntry&
 
     if (entry.fs_mgr_flags.check ||
         (fs_stat & (FS_STAT_UNCLEAN_SHUTDOWN | FS_STAT_QUOTA_ENABLED))) {
-        check_fs(blk_device, entry.fs_type, entry.mount_point, &fs_stat);
+        check_fs(blk_device, entry.fs_type, mount_point, &fs_stat);
     }
 
     if (is_extfs(entry.fs_type) &&
@@ -733,13 +791,6 @@ bool fs_mgr_is_device_unlocked() {
 // sets the underlying block device to read-only if the mount is read-only.
 // See "man 2 mount" for return values.
 static int __mount(const std::string& source, const std::string& target, const FstabEntry& entry) {
-    // We need this because sometimes we have legacy symlinks that are
-    // lingering around and need cleaning up.
-    struct stat info;
-    if (lstat(target.c_str(), &info) == 0 && (info.st_mode & S_IFMT) == S_IFLNK) {
-        unlink(target.c_str());
-    }
-    mkdir(target.c_str(), 0755);
     errno = 0;
     unsigned long mountflags = entry.flags;
     int ret = 0;
@@ -758,7 +809,7 @@ static int __mount(const std::string& source, const std::string& target, const F
             opts = entry.fs_options + entry.fs_checkpoint_opts + ":" +
                    std::to_string(gc_allowance) + "%";
         } else {
-            opts = entry.fs_options + entry.fs_checkpoint_opts;
+            opts = entry.fs_options;
         }
         if (save_errno == EAGAIN) {
             PINFO << "Retrying mount (source=" << source << ",target=" << target
@@ -986,12 +1037,11 @@ static int handle_encryptable(const FstabEntry& entry) {
             return FS_MGR_MNTALL_DEV_NOT_ENCRYPTED;
         }
     } else if (should_use_metadata_encryption(entry)) {
-        if (umount(entry.mount_point.c_str()) == 0) {
+        if (umount_retry(entry.mount_point)) {
             return FS_MGR_MNTALL_DEV_NEEDS_METADATA_ENCRYPTION;
-        } else {
-            PERROR << "Could not umount " << entry.mount_point << " - fail since can't encrypt";
-            return FS_MGR_MNTALL_FAIL;
         }
+        PERROR << "Could not umount " << entry.mount_point << " - fail since can't encrypt";
+        return FS_MGR_MNTALL_FAIL;
     } else if (entry.fs_mgr_flags.file_encryption || entry.fs_mgr_flags.force_fde_or_fbe) {
         LINFO << entry.mount_point << " is file encrypted";
         return FS_MGR_MNTALL_DEV_FILE_ENCRYPTED;
@@ -999,6 +1049,19 @@ static int handle_encryptable(const FstabEntry& entry) {
         return FS_MGR_MNTALL_DEV_NOT_ENCRYPTED;
     } else {
         return FS_MGR_MNTALL_DEV_NOT_ENCRYPTABLE;
+    }
+}
+
+static void set_type_property(int status) {
+    switch (status) {
+        case FS_MGR_MNTALL_DEV_MIGHT_BE_ENCRYPTED:
+            SetProperty("ro.crypto.type", "block");
+            break;
+        case FS_MGR_MNTALL_DEV_FILE_ENCRYPTED:
+        case FS_MGR_MNTALL_DEV_IS_METADATA_ENCRYPTED:
+        case FS_MGR_MNTALL_DEV_NEEDS_METADATA_ENCRYPTION:
+            SetProperty("ro.crypto.type", "file");
+            break;
     }
 }
 
@@ -1139,10 +1202,9 @@ class CheckpointManager {
                 // metadata-encrypted device with smaller blocks, we must not change this for
                 // devices shipped with Q or earlier unless they explicitly selected dm-default-key
                 // v2
-                constexpr unsigned int pre_gki_level = __ANDROID_API_Q__;
                 unsigned int options_format_version = android::base::GetUintProperty<unsigned int>(
                         "ro.crypto.dm_default_key.options_format.version",
-                        (android::fscrypt::GetFirstApiLevel() <= pre_gki_level ? 1 : 2));
+                        (android::fscrypt::GetFirstApiLevel() <= __ANDROID_API_Q__ ? 1 : 2));
                 if (options_format_version > 1) {
                     bowTarget->SetBlockSize(4096);
                 }
@@ -1315,6 +1377,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
     int error_count = 0;
     CheckpointManager checkpoint_manager;
     AvbUniquePtr avb_handle(nullptr);
+    bool wiped = false;
 
     bool userdata_mounted = false;
     if (fstab->empty()) {
@@ -1394,6 +1457,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 avb_handle = AvbHandle::Open();
                 if (!avb_handle) {
                     LERROR << "Failed to open AvbHandle";
+                    set_type_property(encryptable);
                     return {FS_MGR_MNTALL_FAIL, userdata_mounted};
                 }
             }
@@ -1447,9 +1511,11 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
                 encryptable = status;
                 if (status == FS_MGR_MNTALL_DEV_NEEDS_METADATA_ENCRYPTION) {
                     if (!call_vdc({"cryptfs", "encryptFstab", attempted_entry.blk_device,
-                                   attempted_entry.mount_point},
+                                   attempted_entry.mount_point, wiped ? "true" : "false",
+                                   attempted_entry.fs_type},
                                   nullptr)) {
                         LERROR << "Encryption failed";
+                        set_type_property(encryptable);
                         return {FS_MGR_MNTALL_FAIL, userdata_mounted};
                     }
                 }
@@ -1463,7 +1529,7 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
         }
 
         // Mounting failed, understand why and retry.
-        bool wiped = partition_wiped(current_entry.blk_device.c_str());
+        wiped = partition_wiped(current_entry.blk_device.c_str());
         bool crypt_footer = false;
         if (mount_errno != EBUSY && mount_errno != EACCES &&
             current_entry.fs_mgr_flags.formattable && wiped) {
@@ -1488,6 +1554,27 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
             } else if (current_entry.is_encryptable() && current_entry.key_loc == KEY_IN_FOOTER) {
                 crypt_footer = true;
             }
+
+            // EncryptInplace will be used when vdc gives an error or needs to format partitions
+            // other than /data
+            if (should_use_metadata_encryption(current_entry) &&
+                current_entry.mount_point == "/data") {
+
+                // vdc->Format requires "ro.crypto.type" to set an encryption flag
+                encryptable = FS_MGR_MNTALL_DEV_IS_METADATA_ENCRYPTED;
+                set_type_property(encryptable);
+
+                if (!call_vdc({"cryptfs", "encryptFstab", current_entry.blk_device,
+                               current_entry.mount_point, "true" /* shouldFormat */,
+                               current_entry.fs_type},
+                              nullptr)) {
+                    LERROR << "Encryption failed";
+                } else {
+                    userdata_mounted = true;
+                    continue;
+                }
+            }
+
             if (fs_mgr_do_format(current_entry, crypt_footer) == 0) {
                 // Let's replay the mount actions.
                 i = top_idx - 1;
@@ -1551,6 +1638,8 @@ MountAllResult fs_mgr_mount_all(Fstab* fstab, int mount_mode) {
             continue;
         }
     }
+
+    set_type_property(encryptable);
 
 #if ALLOW_ADBD_DISABLE_VERITY == 1  // "userdebug" build
     fs_mgr_overlayfs_mount_all(fstab);
@@ -1789,17 +1878,22 @@ int fs_mgr_remount_userdata_into_checkpointing(Fstab* fstab) {
 
 // wrapper to __mount() and expects a fully prepared fstab_rec,
 // unlike fs_mgr_do_mount which does more things with avb / verity etc.
-int fs_mgr_do_mount_one(const FstabEntry& entry, const std::string& mount_point) {
+int fs_mgr_do_mount_one(const FstabEntry& entry, const std::string& alt_mount_point) {
     // First check the filesystem if requested.
     if (entry.fs_mgr_flags.wait && !WaitForFile(entry.blk_device, 20s)) {
         LERROR << "Skipping mounting '" << entry.blk_device << "'";
     }
 
-    // Run fsck if needed
-    prepare_fs_for_mount(entry.blk_device, entry);
+    auto& mount_point = alt_mount_point.empty() ? entry.mount_point : alt_mount_point;
 
-    int ret =
-            __mount(entry.blk_device, mount_point.empty() ? entry.mount_point : mount_point, entry);
+    // Run fsck if needed
+    int ret = prepare_fs_for_mount(entry.blk_device, entry, mount_point);
+    // Wiped case doesn't require to try __mount below.
+    if (ret & FS_STAT_INVALID_MAGIC) {
+      return FS_MGR_DOMNT_FAILED;
+    }
+
+    ret = __mount(entry.blk_device, mount_point, entry);
     if (ret) {
       ret = (errno == EBUSY) ? FS_MGR_DOMNT_BUSY : FS_MGR_DOMNT_FAILED;
     }
@@ -1858,7 +1952,14 @@ static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
             continue;
         }
 
-        int fs_stat = prepare_fs_for_mount(n_blk_device, fstab_entry);
+        // Now mount it where requested */
+        if (tmp_mount_point) {
+            mount_point = tmp_mount_point;
+        } else {
+            mount_point = fstab_entry.mount_point;
+        }
+
+        int fs_stat = prepare_fs_for_mount(n_blk_device, fstab_entry, mount_point);
 
         if (fstab_entry.fs_mgr_flags.avb) {
             if (!avb_handle) {
@@ -1892,12 +1993,6 @@ static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
             }
         }
 
-        // Now mount it where requested */
-        if (tmp_mount_point) {
-            mount_point = tmp_mount_point;
-        } else {
-            mount_point = fstab_entry.mount_point;
-        }
         int retry_count = 2;
         while (retry_count-- > 0) {
             if (!__mount(n_blk_device, mount_point, fstab_entry)) {
@@ -1909,7 +2004,7 @@ static int fs_mgr_do_mount_helper(Fstab* fstab, const std::string& n_name,
                 mount_errors++;
                 fs_stat |= FS_STAT_FULL_MOUNT_FAILED;
                 // try again after fsck
-                check_fs(n_blk_device, fstab_entry.fs_type, fstab_entry.mount_point, &fs_stat);
+                check_fs(n_blk_device, fstab_entry.fs_type, mount_point, &fs_stat);
             }
         }
         log_fs_stat(fstab_entry.blk_device, fs_stat);
@@ -2018,11 +2113,18 @@ static bool PrepareZramBackingDevice(off64_t size) {
 
     ConfigureIoScheduler(loop_device);
 
+    ConfigureQueueDepth(loop_device, "/");
+
+    ConfigureQueueDepth(loop_device, "/");
+
     // set block size & direct IO
     unique_fd loop_fd(TEMP_FAILURE_RETRY(open(loop_device.c_str(), O_RDWR | O_CLOEXEC)));
     if (loop_fd.get() == -1) {
         PERROR << "Cannot open " << loop_device;
         return false;
+    }
+    if (!LoopControl::SetAutoClearStatus(loop_fd.get())) {
+        PERROR << "Failed set LO_FLAGS_AUTOCLEAR for " << loop_device;
     }
     if (!LoopControl::EnableDirectIo(loop_fd.get())) {
         return false;
@@ -2136,6 +2238,41 @@ bool fs_mgr_is_verity_enabled(const FstabEntry& entry) {
     return false;
 }
 
+std::string fs_mgr_get_hashtree_algorithm(const android::fs_mgr::FstabEntry& entry) {
+    if (!entry.fs_mgr_flags.verify && !entry.fs_mgr_flags.avb) {
+        return "";
+    }
+    DeviceMapper& dm = DeviceMapper::Instance();
+    std::string device = GetVerityDeviceName(entry);
+
+    std::vector<DeviceMapper::TargetInfo> table;
+    if (dm.GetState(device) == DmDeviceState::INVALID || !dm.GetTableInfo(device, &table)) {
+        return "";
+    }
+    for (const auto& target : table) {
+        if (strcmp(target.spec.target_type, "verity") != 0) {
+            continue;
+        }
+
+        // The format is stable for dm-verity version 0 & 1. And the data is expected to have
+        // the fixed format:
+        // <version> <dev> <hash_dev> <data_block_size> <hash_block_size> <num_data_blocks>
+        // <hash_start_block> <algorithm> <digest> <salt>
+        // Details in https://www.kernel.org/doc/html/latest/admin-guide/device-mapper/verity.html
+
+        std::vector<std::string> tokens = android::base::Split(target.data, " \t\r\n");
+        if (tokens[0] != "0" && tokens[0] != "1") {
+            LOG(WARNING) << "Unrecognized device mapper version in " << target.data;
+            return "";
+        }
+
+        // Hashtree algorithm is the 8th token in the output
+        return android::base::Trim(tokens[7]);
+    }
+
+    return "";
+}
+
 bool fs_mgr_verity_is_check_at_most_once(const android::fs_mgr::FstabEntry& entry) {
     if (!entry.fs_mgr_flags.verify && !entry.fs_mgr_flags.avb) {
         return false;
@@ -2161,7 +2298,8 @@ std::string fs_mgr_get_super_partition_name(int slot) {
     // Devices upgrading to dynamic partitions are allowed to specify a super
     // partition name. This includes cuttlefish, which is a non-A/B device.
     std::string super_partition;
-    if (fs_mgr_get_boot_config_from_kernel_cmdline("super_partition", &super_partition)) {
+    if (fs_mgr_get_boot_config_from_bootconfig_source("super_partition", &super_partition) ||
+        fs_mgr_get_boot_config_from_kernel_cmdline("super_partition", &super_partition)) {
         if (fs_mgr_get_slot_suffix().empty()) {
             return super_partition;
         }
@@ -2176,4 +2314,82 @@ std::string fs_mgr_get_super_partition_name(int slot) {
         return super_partition + suffix;
     }
     return LP_METADATA_DEFAULT_PARTITION_NAME;
+}
+
+bool fs_mgr_create_canonical_mount_point(const std::string& mount_point) {
+    auto saved_errno = errno;
+    auto ok = true;
+    auto created_mount_point = !mkdir(mount_point.c_str(), 0755);
+    std::string real_mount_point;
+    if (!Realpath(mount_point, &real_mount_point)) {
+        ok = false;
+        PERROR << "failed to realpath(" << mount_point << ")";
+    } else if (mount_point != real_mount_point) {
+        ok = false;
+        LERROR << "mount point is not canonical: realpath(" << mount_point << ") -> "
+               << real_mount_point;
+    }
+    if (!ok && created_mount_point) {
+        rmdir(mount_point.c_str());
+    }
+    errno = saved_errno;
+    return ok;
+}
+
+bool fs_mgr_mount_overlayfs_fstab_entry(const FstabEntry& entry) {
+    auto overlayfs_valid_result = fs_mgr_overlayfs_valid();
+    if (overlayfs_valid_result == OverlayfsValidResult::kNotSupported) {
+        LERROR << __FUNCTION__ << "(): kernel does not support overlayfs";
+        return false;
+    }
+
+#if ALLOW_ADBD_DISABLE_VERITY == 0
+    // Allowlist the mount point if user build.
+    static const std::vector<const std::string> kAllowedPaths = {
+            "/odm", "/odm_dlkm", "/oem", "/product", "/system_ext", "/vendor", "/vendor_dlkm",
+    };
+    static const std::vector<const std::string> kAllowedPrefixes = {
+            "/mnt/product/",
+            "/mnt/vendor/",
+    };
+    if (std::none_of(kAllowedPaths.begin(), kAllowedPaths.end(),
+                     [&entry](const auto& path) -> bool {
+                         return entry.mount_point == path ||
+                                StartsWith(entry.mount_point, path + "/");
+                     }) &&
+        std::none_of(kAllowedPrefixes.begin(), kAllowedPrefixes.end(),
+                     [&entry](const auto& prefix) -> bool {
+                         return entry.mount_point != prefix &&
+                                StartsWith(entry.mount_point, prefix);
+                     })) {
+        LERROR << __FUNCTION__
+               << "(): mount point is forbidden on user build: " << entry.mount_point;
+        return false;
+    }
+#endif  // ALLOW_ADBD_DISABLE_VERITY == 0
+
+    if (!fs_mgr_create_canonical_mount_point(entry.mount_point)) {
+        return false;
+    }
+
+    auto options = "lowerdir=" + entry.lowerdir;
+    if (overlayfs_valid_result == OverlayfsValidResult::kOverrideCredsRequired) {
+        options += ",override_creds=off";
+    }
+
+    // Use "overlay-" + entry.blk_device as the mount() source, so that adb-remout-test don't
+    // confuse this with adb remount overlay, whose device name is "overlay".
+    // Overlayfs is a pseudo filesystem, so the source device is a symbolic value and isn't used to
+    // back the filesystem. However the device name would be shown in /proc/mounts.
+    auto source = "overlay-" + entry.blk_device;
+    auto report = "__mount(source=" + source + ",target=" + entry.mount_point + ",type=overlay," +
+                  options + ")=";
+    auto ret = mount(source.c_str(), entry.mount_point.c_str(), "overlay", MS_RDONLY | MS_NOATIME,
+                     options.c_str());
+    if (ret) {
+        PERROR << report << ret;
+        return false;
+    }
+    LINFO << report << ret;
+    return true;
 }

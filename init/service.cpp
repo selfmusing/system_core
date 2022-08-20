@@ -45,12 +45,14 @@
 #include <android/api-level.h>
 
 #include "mount_namespace.h"
+#include "reboot_utils.h"
 #include "selinux.h"
 #else
 #include "host_init_stubs.h"
 #endif
 
 using android::base::boot_clock;
+using android::base::GetBoolProperty;
 using android::base::GetProperty;
 using android::base::Join;
 using android::base::make_scope_guard;
@@ -71,12 +73,12 @@ static Result<std::string> ComputeContextFromExecutable(const std::string& servi
     if (getcon(&raw_con) == -1) {
         return Error() << "Could not get security context";
     }
-    std::unique_ptr<char> mycon(raw_con);
+    std::unique_ptr<char, decltype(&freecon)> mycon(raw_con, freecon);
 
     if (getfilecon(service_path.c_str(), &raw_filecon) == -1) {
         return Error() << "Could not get file context";
     }
-    std::unique_ptr<char> filecon(raw_filecon);
+    std::unique_ptr<char, decltype(&freecon)> filecon(raw_filecon, freecon);
 
     char* new_con = nullptr;
     int rc = security_compute_create(mycon.get(), filecon.get(),
@@ -126,12 +128,6 @@ static bool ExpandArgsAndExecv(const std::vector<std::string>& args, bool sigsto
     return execv(c_strings[0], c_strings.data()) == 0;
 }
 
-static bool AreRuntimeApexesReady() {
-    struct stat buf;
-    return stat("/apex/com.android.art/", &buf) == 0 &&
-           stat("/apex/com.android.runtime/", &buf) == 0;
-}
-
 unsigned long Service::next_start_order_ = 1;
 bool Service::is_exec_service_running_ = false;
 
@@ -156,6 +152,7 @@ Service::Service(const std::string& name, unsigned flags, uid_t uid, gid_t gid,
                  .priority = 0},
       namespaces_{.flags = namespace_flags},
       seclabel_(seclabel),
+      subcontext_(subcontext_for_restart_commands),
       onrestart_(false, subcontext_for_restart_commands, "<Service '" + name + "' onrestart>", 0,
                  "onrestart", {}),
       oom_score_adjust_(DEFAULT_OOM_SCORE_ADJUST),
@@ -313,22 +310,28 @@ void Service::Reap(const siginfo_t& siginfo) {
 #else
     static bool is_apex_updatable = false;
 #endif
-    const bool is_process_updatable = !pre_apexd_ && is_apex_updatable;
+    const bool is_process_updatable = !use_bootstrap_ns_ && is_apex_updatable;
 
-    // If we crash > 4 times in 4 minutes or before boot_completed,
+    // If we crash > 4 times in 'fatal_crash_window_' minutes or before boot_completed,
     // reboot into bootloader or set crashing property
     boot_clock::time_point now = boot_clock::now();
     if (((flags_ & SVC_CRITICAL) || is_process_updatable) && !(flags_ & SVC_RESTART)) {
-        bool boot_completed = android::base::GetBoolProperty("sys.boot_completed", false);
-        if (now < time_crashed_ + 4min || !boot_completed) {
+        bool boot_completed = GetBoolProperty("sys.boot_completed", false);
+        if (now < time_crashed_ + fatal_crash_window_ || !boot_completed) {
             if (++crash_count_ > 4) {
+                auto exit_reason = boot_completed ?
+                    "in " + std::to_string(fatal_crash_window_.count()) + " minutes" :
+                    "before boot completed";
                 if (flags_ & SVC_CRITICAL) {
-                    // Aborts into bootloader
-                    LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
-                               << (boot_completed ? "in 4 minutes" : "before boot completed");
+                    if (!GetBoolProperty("init.svc_debug.no_fatal." + name_, false)) {
+                        // Aborts into `fatal_reboot_target_'.
+                        SetFatalRebootTarget(fatal_reboot_target_);
+                        LOG(FATAL) << "critical process '" << name_ << "' exited 4 times "
+                                   << exit_reason;
+                    }
                 } else {
-                    LOG(ERROR) << "updatable process '" << name_ << "' exited 4 times "
-                               << (boot_completed ? "in 4 minutes" : "before boot completed");
+                    LOG(ERROR) << "process with updatable components '" << name_
+                               << "' exited 4 times " << exit_reason;
                     // Notifies update_verifier and apexd
                     SetProperty("sys.init.updatable_crashing_process_name", name_);
                     SetProperty("sys.init.updatable_crashing", "1");
@@ -394,6 +397,14 @@ Result<void> Service::ExecStart() {
     return {};
 }
 
+static void ClosePipe(const std::array<int, 2>* pipe) {
+    for (const auto fd : *pipe) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+}
+
 Result<void> Service::Start() {
     auto reboot_on_failure = make_scope_guard([this] {
         if (on_failure_reboot_target_) {
@@ -425,6 +436,12 @@ Result<void> Service::Start() {
         // It is not an error to try to start a service that is already running.
         reboot_on_failure.Disable();
         return {};
+    }
+
+    std::unique_ptr<std::array<int, 2>, decltype(&ClosePipe)> pipefd(new std::array<int, 2>{-1, -1},
+                                                                     ClosePipe);
+    if (pipe(pipefd->data()) < 0) {
+        return ErrnoError() << "pipe()";
     }
 
     bool needs_console = (flags_ & SVC_CONSOLE);
@@ -460,12 +477,26 @@ Result<void> Service::Start() {
         scon = *result;
     }
 
-    if (!AreRuntimeApexesReady() && !pre_apexd_) {
-        // If this service is started before the Runtime and ART APEXes get
-        // available, mark it as pre-apexd one. Note that this marking is
+    // APEXd is always started in the "current" namespace because it is the process to set up
+    // the current namespace.
+    const bool is_apexd = args_[0] == "/system/bin/apexd";
+
+    if (!IsDefaultMountNamespaceReady() && !is_apexd) {
+        // If this service is started before APEXes and corresponding linker configuration
+        // get available, mark it as pre-apexd one. Note that this marking is
         // permanent. So for example, if the service is re-launched (e.g., due
         // to crash), it is still recognized as pre-apexd... for consistency.
-        pre_apexd_ = true;
+        use_bootstrap_ns_ = true;
+    }
+
+    // For pre-apexd services, override mount namespace as "bootstrap" one before starting.
+    // Note: "ueventd" is supposed to be run in "default" mount namespace even if it's pre-apexd
+    // to support loading firmwares from APEXes.
+    std::optional<MountNamespace> override_mount_namespace;
+    if (name_ == "ueventd") {
+        override_mount_namespace = NS_DEFAULT;
+    } else if (use_bootstrap_ns_) {
+        override_mount_namespace = NS_BOOTSTRAP;
     }
 
     post_data_ = ServiceList::GetInstance().IsPostData();
@@ -499,7 +530,8 @@ Result<void> Service::Start() {
     if (pid == 0) {
         umask(077);
 
-        if (auto result = EnterNamespaces(namespaces_, name_, pre_apexd_); !result.ok()) {
+        if (auto result = EnterNamespaces(namespaces_, name_, override_mount_namespace);
+            !result.ok()) {
             LOG(FATAL) << "Service '" << name_
                        << "' failed to set up namespaces: " << result.error();
         }
@@ -515,6 +547,13 @@ Result<void> Service::Start() {
         if (auto result = WritePidToFiles(&writepid_files_); !result.ok()) {
             LOG(ERROR) << "failed to write pid to files: " << result.error();
         }
+
+        // Wait until the cgroups have been created and until the cgroup controllers have been
+        // activated.
+        if (std::byte byte; read((*pipefd)[0], &byte, 1) < 0) {
+            PLOG(ERROR) << "failed to read from notification channel";
+        }
+        pipefd.reset();
 
         if (task_profiles_.size() > 0 && !SetTaskProfiles(getpid(), task_profiles_)) {
             LOG(ERROR) << "failed to set task profiles";
@@ -600,6 +639,10 @@ Result<void> Service::Start() {
 
     if (oom_score_adjust_ != DEFAULT_OOM_SCORE_ADJUST) {
         LmkdRegister(name_, proc_attr_.uid, pid_, oom_score_adjust_);
+    }
+
+    if (write((*pipefd)[1], "", 1) < 0) {
+        return ErrnoError() << "sending notification failed";
     }
 
     NotifyStateChange("running");

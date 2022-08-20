@@ -187,7 +187,6 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
     static SysfsStringEnumMap<int> supplyTypeMap[] = {
             {"Unknown", ANDROID_POWER_SUPPLY_TYPE_UNKNOWN},
             {"Battery", ANDROID_POWER_SUPPLY_TYPE_BATTERY},
-            {"BMS", ANDROID_POWER_SUPPLY_TYPE_BATTERY},
             {"UPS", ANDROID_POWER_SUPPLY_TYPE_AC},
             {"Mains", ANDROID_POWER_SUPPLY_TYPE_AC},
             {"USB", ANDROID_POWER_SUPPLY_TYPE_USB},
@@ -200,7 +199,6 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
             {"USB_C", ANDROID_POWER_SUPPLY_TYPE_AC},
             {"USB_PD", ANDROID_POWER_SUPPLY_TYPE_AC},
             {"USB_PD_DRP", ANDROID_POWER_SUPPLY_TYPE_USB},
-            {"Wipower", ANDROID_POWER_SUPPLY_TYPE_WIRELESS},
             {"Wireless", ANDROID_POWER_SUPPLY_TYPE_WIRELESS},
             {"DASH", ANDROID_POWER_SUPPLY_TYPE_AC},
             {NULL, 0},
@@ -370,6 +368,16 @@ void BatteryMonitor::updateValues(void) {
                   (access(SYSFS_BATTERY_VOLTAGE, R_OK) == 0) ? getIntField(String8(SYSFS_BATTERY_VOLTAGE)) :
                    DEFAULT_VBUS_VOLTAGE;
 
+            // there are devices that have the file but with a value of 0
+            if (ChargingVoltage == 0) {
+                ChargingVoltage = DEFAULT_VBUS_VOLTAGE;
+            }
+
+            // there are devices that have the file but with a value of 0
+            if (ChargingVoltage == 0) {
+                ChargingVoltage = DEFAULT_VBUS_VOLTAGE;
+            }
+
             double power = ((double)ChargingCurrent / MILLION) *
                            ((double)ChargingVoltage / MILLION);
             if (MaxPower < power) {
@@ -382,9 +390,14 @@ void BatteryMonitor::updateValues(void) {
 }
 
 void BatteryMonitor::logValues(void) {
+    logValues(*mHealthInfo, *mHealthdConfig);
+}
+
+void BatteryMonitor::logValues(const android::hardware::health::V2_1::HealthInfo& health_info,
+                               const struct healthd_config& healthd_config) {
     char dmesgline[256];
     size_t len;
-    const HealthInfo_1_0& props = mHealthInfo->legacy.legacy;
+    const HealthInfo_1_0& props = health_info.legacy.legacy;
     if (props.batteryPresent) {
         snprintf(dmesgline, sizeof(dmesgline), "battery l=%d v=%d t=%s%d.%d h=%d st=%d",
                  props.batteryLevel, props.batteryVoltage, props.batteryTemperature < 0 ? "-" : "",
@@ -392,17 +405,17 @@ void BatteryMonitor::logValues(void) {
                  props.batteryHealth, props.batteryStatus);
 
         len = strlen(dmesgline);
-        if (!mHealthdConfig->batteryCurrentNowPath.isEmpty()) {
+        if (!healthd_config.batteryCurrentNowPath.isEmpty()) {
             len += snprintf(dmesgline + len, sizeof(dmesgline) - len, " c=%d",
                             props.batteryCurrent);
         }
 
-        if (!mHealthdConfig->batteryFullChargePath.isEmpty()) {
+        if (!healthd_config.batteryFullChargePath.isEmpty()) {
             len += snprintf(dmesgline + len, sizeof(dmesgline) - len, " fc=%d",
                             props.batteryFullCharge);
         }
 
-        if (!mHealthdConfig->batteryCycleCountPath.isEmpty()) {
+        if (!healthd_config.batteryCycleCountPath.isEmpty()) {
             len += snprintf(dmesgline + len, sizeof(dmesgline) - len, " cc=%d",
                             props.batteryCycleCount);
         }
