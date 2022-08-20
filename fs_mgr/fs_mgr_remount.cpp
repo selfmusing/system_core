@@ -153,7 +153,7 @@ static int do_remount(int argc, char* argv[]) {
     // If somehow this executable is delivered on a "user" build, it can
     // not function, so providing a clear message to the caller rather than
     // letting if fall through and provide a lot of confusing failure messages.
-    if (!ALLOW_ADBD_DISABLE_VERITY) {
+    if (!ALLOW_ADBD_DISABLE_VERITY || (android::base::GetProperty("ro.debuggable", "0") != "1")) {
         LOG(ERROR) << "only functions on userdebug or eng builds";
         return NOT_USERDEBUG;
     }
@@ -445,8 +445,7 @@ static int do_remount(int argc, char* argv[]) {
         fs_mgr_set_blk_ro(blk_device, false);
 
         // Find system-as-root mount point?
-        if ((mount_point == "/system" || mount_point == "/system_root") &&
-            !GetEntryForMountPoint(&mounts, mount_point) &&
+        if ((mount_point == "/system") && !GetEntryForMountPoint(&mounts, mount_point) &&
             GetEntryForMountPoint(&mounts, "/")) {
             mount_point = "/";
         }
@@ -496,6 +495,7 @@ int main(int argc, char* argv[]) {
     int result = do_remount(argc, argv);
     if (result == MUST_REBOOT) {
         LOG(INFO) << "Now reboot your device for settings to take effect";
+        result = 0;
     } else if (result == REMOUNT_SUCCESS) {
         printf("remount succeeded\n");
     } else if (result == CLEAN_SCRATCH_FILES) {

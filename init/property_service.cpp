@@ -73,7 +73,6 @@
 #include "subcontext.h"
 #include "system/core/init/property_service.pb.h"
 #include "util.h"
-#include "vendor_init.h"
 
 using namespace std::literals;
 
@@ -101,6 +100,7 @@ constexpr auto ID_PROP = "ro.build.id";
 constexpr auto LEGACY_ID_PROP = "ro.build.legacy.id";
 constexpr auto VBMETA_DIGEST_PROP = "ro.boot.vbmeta.digest";
 constexpr auto DIGEST_SIZE_USED = 8;
+constexpr auto API_LEVEL_CURRENT = 10000;
 
 static bool persistent_properties_loaded = false;
 
@@ -117,8 +117,6 @@ struct PropertyAuditData {
     const ucred* cr;
     const char* name;
 };
-
-static bool weaken_prop_override_security = false;
 
 static int PropertyAuditCallback(void* data, security_class_t /*cls*/, char* buf, size_t len) {
     auto* d = reinterpret_cast<PropertyAuditData*>(data);
@@ -190,8 +188,8 @@ static uint32_t PropertySet(const std::string& name, const std::string& value, s
 
     prop_info* pi = (prop_info*) __system_property_find(name.c_str());
     if (pi != nullptr) {
-        // ro.* properties are actually "write-once", unless the system decides to
-        if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
+        // ro.* properties are actually "write-once".
+        if (StartsWith(name, "ro.")) {
             *error = "Read-only property was already set";
             return PROP_ERROR_READ_ONLY_PROPERTY;
         }
@@ -797,72 +795,6 @@ static void load_override_properties() {
     }
 }
 
-static const char *snet_prop_key[] = {
-    "ro.boot.selinux",
-    "ro.boot.warranty_bit",
-    "ro.warranty_bit",
-    "ro.debuggable",
-    "ro.secure",
-    "ro.build.type",
-    "ro.system.build.type",
-    "ro.system_ext.build.type",
-    "ro.vendor.build.type",
-    "ro.product.build.type",
-    "ro.odm.build.type",
-    "ro.build.keys",
-    "ro.build.tags",
-    "ro.system.build.tags",
-    "ro.vendor.boot.warranty_bit",
-    "ro.vendor.warranty_bit",
-    NULL
-};
-
-static const char *snet_prop_value[] = {
-    "enforcing", // ro.boot.selinux
-    "0", // ro.boot.warranty_bit
-    "0", // ro.warranty_bit
-    "0", // ro.debuggable
-    "1", // ro.secure
-    "user", // ro.build.type
-    "user", // ro.system.build.type
-    "user", // ro.system_ext.build.type
-    "user", // ro.vendor.build.type
-    "user", // ro.product.build.type
-    "user", // ro.odm.build.type
-    "release-keys", // ro.build.keys
-    "release-keys", // ro.build.tags
-    "release-keys", // ro.system.build.tags
-    "0", // ro.vendor.boot.warranty_bit
-    "0", // ro.vendor.warranty_bit
-    NULL
-};
-
-static void workaround_snet_properties() {
-    std::string build_type = android::base::GetProperty("ro.build.type", "");
-
-    // Weaken property override security to set safetynet props
-    weaken_prop_override_security = true;
-
-    std::string error;
-
-    // Hide all sensitive props if not eng build
-    if (build_type != "eng") {
-        LOG(INFO) << "snet: Hiding sensitive props";
-        for (int i = 0; snet_prop_key[i]; ++i) {
-            PropertySet(snet_prop_key[i], snet_prop_value[i], &error);
-        }
-    }
-
-    // Extra pops
-    std::string build_flavor_key = "ro.build.flavor";
-    std::string build_flavor_value = android::base::GetProperty(build_flavor_key, "");
-    build_flavor_value = android::base::StringReplace(build_flavor_value, "userdebug", "user", false);
-    PropertySet(build_flavor_key, build_flavor_value, &error);
-
-    // Restore the normal property override security after safetynet props have been set
-    weaken_prop_override_security = false;
-}
-
 // If the ro.product.[brand|device|manufacturer|model|name] properties have not been explicitly
 // set, derive them from ro.product.${partition}.* properties
 static void property_initialize_ro_product_props() {
@@ -1086,6 +1018,39 @@ static void property_initialize_ro_cpu_abilist() {
     }
 }
 
+static int read_api_level_props(const std::vector<std::string>& api_level_props) {
+    int api_level = API_LEVEL_CURRENT;
+    for (const auto& api_level_prop : api_level_props) {
+        api_level = android::base::GetIntProperty(api_level_prop, API_LEVEL_CURRENT);
+        if (api_level != API_LEVEL_CURRENT) {
+            break;
+        }
+    }
+    return api_level;
+}
+
+static void property_initialize_ro_vendor_api_level() {
+    // ro.vendor.api_level shows the api_level that the vendor images (vendor, odm, ...) are
+    // required to support.
+    constexpr auto VENDOR_API_LEVEL_PROP = "ro.vendor.api_level";
+
+    // Api level properties of the board. The order of the properties must be kept.
+    std::vector<std::string> BOARD_API_LEVEL_PROPS = {"ro.board.api_level",
+                                                      "ro.board.first_api_level"};
+    // Api level properties of the device. The order of the properties must be kept.
+    std::vector<std::string> DEVICE_API_LEVEL_PROPS = {"ro.product.first_api_level",
+                                                       "ro.build.version.sdk"};
+
+    int api_level = std::min(read_api_level_props(BOARD_API_LEVEL_PROPS),
+                             read_api_level_props(DEVICE_API_LEVEL_PROPS));
+    std::string error;
+    uint32_t res = PropertySet(VENDOR_API_LEVEL_PROP, std::to_string(api_level), &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Failed to set " << VENDOR_API_LEVEL_PROP << " with " << api_level << ": "
+                   << error << "(" << res << ")";
+    }
+}
+
 void PropertyLoadBootDefaults() {
     // We read the properties and their values into a map, in order to always allow properties
     // loaded in the later property files to override the properties in loaded in the earlier
@@ -1142,6 +1107,7 @@ void PropertyLoadBootDefaults() {
     LoadPropertiesFromSecondStageRes(&properties);
     load_properties_from_file("/system/build.prop", nullptr, &properties);
     load_properties_from_partition("system_ext", /* support_legacy_path_until */ 30);
+    load_properties_from_file("/system_dlkm/etc/build.prop", nullptr, &properties);
     // TODO(b/117892318): uncomment the following condition when vendor.imgs for aosp_* targets are
     // all updated.
     // if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_R__) {
@@ -1166,21 +1132,14 @@ void PropertyLoadBootDefaults() {
         }
     }
 
-    // Update with vendor-specific property runtime overrides
-    vendor_load_properties();
-
     property_initialize_ro_product_props();
     property_initialize_build_id();
     property_derive_build_fingerprint();
     property_derive_legacy_build_fingerprint();
     property_initialize_ro_cpu_abilist();
+    property_initialize_ro_vendor_api_level();
 
     update_sys_usb_config();
-
-    // Workaround SafetyNet
-    if (!IsRecoveryMode()) {
-        workaround_snet_properties();
-    }
 }
 
 bool LoadPropertyInfoFromFile(const std::string& filename,
@@ -1213,14 +1172,15 @@ void CreateSerializedPropertyInfo() {
         // Don't check for failure here, since we don't always have all of these partitions.
         // E.g. In case of recovery, the vendor partition will not have mounted and we
         // still need the system / platform properties to function.
+        if (access("/dev/selinux/apex_property_contexts", R_OK) != -1) {
+            LoadPropertyInfoFromFile("/dev/selinux/apex_property_contexts", &property_infos);
+        }
         if (access("/system_ext/etc/selinux/system_ext_property_contexts", R_OK) != -1) {
             LoadPropertyInfoFromFile("/system_ext/etc/selinux/system_ext_property_contexts",
                                      &property_infos);
         }
-        if (!LoadPropertyInfoFromFile("/vendor/etc/selinux/vendor_property_contexts",
-                                      &property_infos)) {
-            // Fallback to nonplat_* if vendor_* doesn't exist.
-            LoadPropertyInfoFromFile("/vendor/etc/selinux/nonplat_property_contexts",
+        if (access("/vendor/etc/selinux/vendor_property_contexts", R_OK) != -1) {
+            LoadPropertyInfoFromFile("/vendor/etc/selinux/vendor_property_contexts",
                                      &property_infos);
         }
         if (access("/product/etc/selinux/product_property_contexts", R_OK) != -1) {
@@ -1235,12 +1195,10 @@ void CreateSerializedPropertyInfo() {
             return;
         }
         LoadPropertyInfoFromFile("/system_ext_property_contexts", &property_infos);
-        if (!LoadPropertyInfoFromFile("/vendor_property_contexts", &property_infos)) {
-            // Fallback to nonplat_* if vendor_* doesn't exist.
-            LoadPropertyInfoFromFile("/nonplat_property_contexts", &property_infos);
-        }
+        LoadPropertyInfoFromFile("/vendor_property_contexts", &property_infos);
         LoadPropertyInfoFromFile("/product_property_contexts", &property_infos);
         LoadPropertyInfoFromFile("/odm_property_contexts", &property_infos);
+        LoadPropertyInfoFromFile("/dev/selinux/apex_property_contexts", &property_infos);
     }
 
     auto serialized_contexts = std::string();
@@ -1324,23 +1282,6 @@ static void ProcessBootconfig() {
     });
 }
 
-static void SetSafetyNetProps() {
-    // Bail out if this is recovery, fastbootd, or anything other than a normal boot.
-    // fastbootd, in particular, needs the real values so it can allow flashing on
-    // unlocked bootloaders.
-    if (IsRecoveryMode()) {
-        return;
-    }
-
-    // Spoof properties
-    InitPropertySet("ro.boot.flash.locked", "1");
-    InitPropertySet("ro.boot.verifiedbootstate", "green");
-    InitPropertySet("ro.boot.veritymode", "enforcing");
-    InitPropertySet("ro.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.verifiedbootstate", "green");
-}
-
 void PropertyInit() {
     selinux_callback cb;
     cb.func_audit = PropertyAuditCallback;
@@ -1354,9 +1295,6 @@ void PropertyInit() {
     if (!property_info_area.LoadDefaultPath()) {
         LOG(FATAL) << "Failed to load serialized property info file";
     }
-
-    // Report valid verified boot chain to help pass Google SafetyNet integrity checks
-    SetSafetyNetProps();
 
     // If arguments are passed both on the command line and in DT,
     // properties set in DT always have priority over the command-line ones.

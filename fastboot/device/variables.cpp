@@ -26,7 +26,6 @@
 #include <android/hardware/boot/1.1/IBootControl.h>
 #include <ext4_utils/ext4_utils.h>
 #include <fs_mgr.h>
-#include <healthhalutils/HealthHalUtils.h>
 #include <liblp/liblp.h>
 
 #include "fastboot_device.h"
@@ -120,23 +119,17 @@ bool GetVariant(FastbootDevice* device, const std::vector<std::string>& /* args 
 }
 
 bool GetBatteryVoltageHelper(FastbootDevice* device, int32_t* battery_voltage) {
-    using android::hardware::health::V2_0::HealthInfo;
-    using android::hardware::health::V2_0::Result;
+    using aidl::android::hardware::health::HealthInfo;
 
     auto health_hal = device->health_hal();
     if (!health_hal) {
         return false;
     }
 
-    Result ret;
-    auto ret_val = health_hal->getHealthInfo([&](Result result, HealthInfo info) {
-        *battery_voltage = info.legacy.batteryVoltage;
-        ret = result;
-    });
-    if (!ret_val.isOk() || (ret != Result::SUCCESS)) {
-        return false;
-    }
-
+    HealthInfo health_info;
+    auto res = health_hal->getHealthInfo(&health_info);
+    if (!res.isOk()) return false;
+    *battery_voltage = health_info.batteryVoltageMillivolts;
     return true;
 }
 
@@ -435,10 +428,7 @@ std::vector<std::vector<std::string>> GetAllPartitionArgsNoSlot(FastbootDevice* 
 
 bool GetHardwareRevision(FastbootDevice* /* device */, const std::vector<std::string>& /* args */,
                          std::string* message) {
-    *message = android::base::GetProperty("ro.boot.hardware.revision", "");
-    if (message->empty()) {
-        *message = android::base::GetProperty("ro.revision", "");
-    }
+    *message = android::base::GetProperty("ro.revision", "");
     return true;
 }
 

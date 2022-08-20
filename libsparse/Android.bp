@@ -54,23 +54,6 @@ cc_binary {
     cflags: ["-Werror"],
 }
 
-cc_binary_host {
-    name: "simg2img_static",
-    srcs: [
-        "simg2img.cpp",
-        "sparse_crc32.cpp",
-    ],
-    static_libs: [
-        "libsparse",
-        "libz",
-        "libbase",
-    ],
-
-    cflags: ["-Werror"],
-    stl: "libc++_static",
-    static_executable: true,
-}
-
 cc_binary {
     name: "img2simg",
     host_supported: true,
@@ -102,23 +85,25 @@ python_binary_host {
     srcs: ["simg_dump.py"],
     version: {
         py2: {
-            embedded_launcher: true,
-            enabled: true,
+            enabled: false,
         },
         py3: {
-            enabled: false,
+            embedded_launcher: true,
+            enabled: true,
         },
     },
 }
 
 cc_fuzz {
     name: "sparse_fuzzer",
-    host_supported: false,
+    host_supported: true,
     srcs: [
         "sparse_fuzzer.cpp",
     ],
     static_libs: [
         "libsparse",
+        "libbase",
+        "libz",
         "liblog",
     ],
 }

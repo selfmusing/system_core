@@ -657,10 +657,7 @@ status_t Thread::readyToRun()
 
 status_t Thread::run(const char* name, int32_t priority, size_t stack)
 {
-    if (name == nullptr) {
-        ALOGW("Thread name not provided to Thread::run");
-        name = 0;
-    }
+    LOG_ALWAYS_FATAL_IF(name == nullptr, "thread name not provided to Thread::run");
 
     Mutex::Autolock _l(mLock);
 
@@ -676,7 +673,7 @@ status_t Thread::run(const char* name, int32_t priority, size_t stack)
     mThread = thread_id_t(-1);
 
     // hold a strong reference on ourself
-    mHoldSelf = this;
+    mHoldSelf = sp<Thread>::fromExisting(this);
 
     mRunning = true;
 
